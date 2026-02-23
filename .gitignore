@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Data
+data/raw/
+data/processed/
+
+# Models
+models/*.pkl
+models/*.json
+
+# Environment
+venv/
+.env
