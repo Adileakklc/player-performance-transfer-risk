@@ -22,7 +22,6 @@ def make_players(n=20, team="TR_Club_A", season="2025-2026"):
     return pd.DataFrame(players)
 
 def make_matches(n_matches=28, season="2025-2026"):
-    # haftalık gibi dağıtalım
     start = pd.Timestamp("2025-08-10")
     dates = [start + pd.Timedelta(days=int(7*k + RNG.integers(-1,2))) for k in range(n_matches)]
     return pd.DataFrame({
@@ -35,12 +34,10 @@ def gen_match_data(players, matches):
     rows = []
     for _, m in matches.iterrows():
         for _, p in players.iterrows():
-            # oynama olasılığı pozisyona göre küçük farklar
             play_prob = 0.85 if p["position"] != "GK" else 0.70
             played = RNG.random() < play_prob
             minutes = int(RNG.integers(10, 91)) if played else 0
 
-            # temel performans dağılımları (pozisyona göre kabaca)
             pos = p["position"]
             base_dist = 9.5 if pos in ["CM","DM"] else (8.0 if pos in ["FB","W","AM"] else 6.5)
             distance_km = float(max(0, RNG.normal(base_dist, 1.2) * (minutes/90))) if minutes>0 else 0.0
@@ -84,13 +81,11 @@ def gen_match_data(players, matches):
     return pd.DataFrame(rows)
 
 def gen_training_load(players, matches):
-    # maç tarihleri arasında haftada 4 antrenman gibi düşün
     start = matches["match_date"].min() - pd.Timedelta(days=7)
     end = matches["match_date"].max() + pd.Timedelta(days=7)
     days = pd.date_range(start, end, freq="D")
     rows = []
     for d in days:
-        # her gün antrenman yok
         is_training_day = d.weekday() in [0,1,3,4]  # Pzt-Salı-Perş-Cuma
         for _, p in players.iterrows():
             if not is_training_day:
@@ -106,26 +101,119 @@ def gen_training_load(players, matches):
             })
     return pd.DataFrame(rows)
 
-def gen_injuries(players, matches):
+# ---------- NEW: workload-driven injury generation ----------
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + np.exp(-x))
+
+def _prepare_daily_load(training: pd.DataFrame) -> pd.DataFrame:
+    # daily load per player (ensure daily granularity)
+    df = training.copy().sort_values(["player_id", "date"])
+    df = df.groupby(["player_id", "date"], as_index=False)["training_load"].sum()
+
+    # rolling means
+    df["load_7"] = df.groupby("player_id")["training_load"].transform(lambda s: s.rolling(7, min_periods=3).mean())
+    df["load_28"] = df.groupby("player_id")["training_load"].transform(lambda s: s.rolling(28, min_periods=10).mean())
+    df["acwr_7_28"] = df["load_7"] / (df["load_28"] + 1e-9)
+
+    # weekly trend proxy: last 7 avg - prev 7 avg
+    df["load_prev7"] = df.groupby("player_id")["training_load"].transform(lambda s: s.shift(7).rolling(7, min_periods=3).mean())
+    df["delta_7"] = (df["load_7"] - df["load_prev7"]).fillna(0)
+
+    return df
+
+def _match_congestion(matches: pd.DataFrame) -> pd.DataFrame:
+    # Count matches in last 7 days at each match date
+    m = matches[["match_date"]].copy().sort_values("match_date")
+    out = []
+    for d in m["match_date"]:
+        cnt7 = ((m["match_date"] > d - pd.Timedelta(days=7)) & (m["match_date"] <= d)).sum()
+        cnt3 = ((m["match_date"] > d - pd.Timedelta(days=3)) & (m["match_date"] <= d)).sum()
+        out.append({"match_date": d, "matches_last7": int(cnt7), "matches_last3": int(cnt3)})
+    return pd.DataFrame(out)
+
+def gen_injuries(players, matches, training):
+    """
+    Injury generation driven by:
+    - ACWR high -> risk ↑
+    - delta_7 positive -> risk ↑
+    - match congestion (3 days / 7 days) -> risk ↑
+    - previous injury -> reinjury risk ↑
+    """
     injury_types = ["hamstring","ankle","groin","knee","calf"]
-    rows = []
-    # sezonda her oyuncuya 0-2 sakatlık gibi
+
+    daily = _prepare_daily_load(training)
+    cong = _match_congestion(matches)
+
     start = matches["match_date"].min()
     end = matches["match_date"].max()
+
+    # Use match days as "risk evaluation" points (simpler & realistic: injuries around matches)
+    match_days = matches["match_date"].sort_values().unique()
+
+    rows = []
     for _, p in players.iterrows():
-        n_inj = int(RNG.choice([0,0,1,1,2], p=[0.30,0.20,0.25,0.15,0.10]))
-        for _ in range(n_inj):
-            injury_date = start + pd.Timedelta(days=int(RNG.integers(0, (end-start).days+1)))
-            itype = RNG.choice(injury_types)
-            days_out = int(np.clip(RNG.normal(14, 10), 3, 60))
-            rows.append({
-                "player_id": p["player_id"],
-                "injury_date": injury_date,
-                "injury_type": itype,
-                "days_out": days_out,
-                "is_reinjury": int(RNG.random() < 0.15)
-            })
-    return pd.DataFrame(rows).sort_values(["player_id","injury_date"])
+        pid = p["player_id"]
+        pos = p["position"]
+
+        # position baseline injury tendency (very rough)
+        pos_bias = {
+            "GK": -0.3, "CB": -0.1, "FB": 0.05, "DM": 0.03,
+            "CM": 0.04, "AM": 0.05, "W": 0.08, "ST": 0.07
+        }.get(pos, 0.0)
+
+        had_injury_before = False
+
+        # evaluate risk on each match day
+        for d in match_days:
+            # get latest daily load row up to date d
+            dload = daily[(daily["player_id"] == pid) & (daily["date"] <= d)].sort_values("date").tail(1)
+            if dload.empty:
+                continue
+
+            acwr = float(dload["acwr_7_28"].iloc[0]) if not pd.isna(dload["acwr_7_28"].iloc[0]) else 1.0
+            delta7 = float(dload["delta_7"].iloc[0])
+
+            # match congestion factors
+            c = cong[cong["match_date"] == d].iloc[0]
+            cong7 = c["matches_last7"]
+            cong3 = c["matches_last3"]
+
+            # normalize terms to reasonable scale
+            acwr_term = np.clip(acwr - 1.0, -0.5, 1.5)          # >1 means acute>chronic
+            delta_term = np.clip(delta7 / 300.0, -1.0, 2.0)     # scale load change
+            cong_term = 0.25 * max(0, cong7 - 1) + 0.35 * max(0, cong3 - 1)
+
+            reinj_term = 0.35 if had_injury_before else 0.0
+
+            # logit risk
+            logit = -2.4 + 1.6 * acwr_term + 1.0 * delta_term + 0.8 * cong_term + 1.2 * reinj_term + pos_bias
+            p_inj = _sigmoid(logit)
+
+            # stochastic injury occurrence
+            if RNG.random() < p_inj:
+                itype = RNG.choice(injury_types)
+                base_days = RNG.normal(14, 9)
+                # more severe when acwr high
+                days_out = int(np.clip(base_days + 10 * max(0, acwr_term), 3, 60))
+
+                rows.append({
+                    "player_id": pid,
+                    "injury_date": pd.Timestamp(d),
+                    "injury_type": itype,
+                    "days_out": days_out,
+                    "is_reinjury": int(had_injury_before)
+                })
+
+                had_injury_before = True
+
+                # simple “cooldown”: after an injury, skip next few match days
+                # (simulate absence / rehabilitation)
+                # We'll break out if too many injuries
+                if len([r for r in rows if r["player_id"] == pid]) >= 5:
+                    break
+
+    return pd.DataFrame(rows).sort_values(["player_id", "injury_date"]).reset_index(drop=True)
 
 def gen_transfer(players):
     rows = []
@@ -154,7 +242,10 @@ def main():
     matches = make_matches(n_matches=28)
     match_data = gen_match_data(players, matches)
     training = gen_training_load(players, matches)
-    injuries = gen_injuries(players, matches)
+
+    # ✅ UPDATED: injuries now depend on workload + congestion
+    injuries = gen_injuries(players, matches, training)
+
     transfer = gen_transfer(players)
 
     players.to_csv(out_dir/"players.csv", index=False)
